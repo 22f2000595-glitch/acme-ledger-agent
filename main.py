@@ -1,331 +1,302 @@
-
-import os
-import re
 import json
 import logging
+import os
+import re
+import sqlite3
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
+from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
-
-app = FastAPI(title="Acme Appliances Ledger Agent", version="1.1.0")
+app = FastAPI(title="Acme Appliances Ledger Agent", version="2.0.0")
 
 EXPORT_URL = os.getenv("LEDGER_EXPORT_URL", "").strip()
-RATES = {
-    "USD": Decimal("1"),
-    "EUR": Decimal("1.06"),
-    "INR": Decimal("0.01223"),
-}
 TZ = ZoneInfo("Asia/Kolkata")
+REQUEST_HEADERS = {"User-Agent": "Acme-Ledger-Agent/2.0"}
 
 MONTHS = {
     "january": 1, "jan": 1, "february": 2, "feb": 2,
-    "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5,
-    "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "march": 3, "mar": 3, "april": 4, "apr": 4,
+    "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
     "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
     "october": 10, "oct": 10, "november": 11, "nov": 11,
     "december": 12, "dec": 12,
 }
 REGIONS = ["North", "South", "East", "West", "Central"]
 PRODUCTS = [
-    "Air Fryer", "Rice Cooker", "Mixer", "Blender",
-    "Grinder", "Kettle", "Toaster", "Juicer",
+    "Air Fryer", "Rice Cooker", "Juicer", "Toaster",
+    "Mixer", "Kettle", "Blender", "Grinder",
 ]
-
 
 class Question(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
+
+
+def make_rates_url(export_url: str) -> str:
+    """Use the same assignment query parameters, changing only /export to /rates."""
+    parts = urlsplit(export_url)
+    path = parts.path.rstrip("/")
+    if path.endswith("/export"):
+        path = path[:-len("/export")] + "/rates"
+    else:
+        path = "/rates"
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
 def parse_dt(value):
     if not value:
         return None
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(TZ)
     except (ValueError, TypeError, AttributeError):
         return None
 
 
+def money(value):
+    amount = Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return int(amount) if amount == amount.to_integral_value() else float(amount)
+
+
+def normalize_status(value):
+    return str(value or "").strip().lower()
+
+
 @lru_cache(maxsize=1)
-def load_orders():
+def load_database():
     if not EXPORT_URL:
-        raise RuntimeError("LEDGER_EXPORT_URL is not configured")
+        raise RuntimeError("LEDGER_EXPORT_URL is not configured in Render")
 
-    response = requests.get(EXPORT_URL, timeout=(3, 10))
-    response.raise_for_status()
+    timeout = (5, 30)
+    rates_url = make_rates_url(EXPORT_URL)
+    logging.info("Fetching currency rates")
+    rates_response = requests.get(rates_url, headers=REQUEST_HEADERS, timeout=timeout)
+    rates_response.raise_for_status()
+    rates_payload = rates_response.json()
+    rates = rates_payload.get("usd_per_unit")
+    if not isinstance(rates, dict) or not rates:
+        raise ValueError("The /rates response does not contain usd_per_unit")
 
+    logging.info("Fetching order ledger")
+    export_response = requests.get(EXPORT_URL, headers=REQUEST_HEADERS, timeout=timeout)
+    export_response.raise_for_status()
     records = []
-    for line in response.text.splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        if isinstance(row, dict) and row.get("id"):
-            records.append(row)
+    for line in export_response.text.splitlines():
+        if line.strip():
+            row = json.loads(line)
+            if isinstance(row, dict) and row.get("id") is not None:
+                records.append(row)
 
+    # Latest updated version of each order wins.
     latest = {}
-    minimum_dt = datetime.min.replace(tzinfo=TZ)
-
+    min_dt = datetime.min.replace(tzinfo=TZ)
     for row in records:
         order_id = str(row["id"])
-        new_dt = parse_dt(row.get("updated_at")) or minimum_dt
-        old = latest.get(order_id)
-        old_dt = (
-            parse_dt(old.get("updated_at")) if old else None
-        ) or minimum_dt
-
-        if old is None or new_dt >= old_dt:
+        updated = parse_dt(row.get("updated_at")) or min_dt
+        prior = latest.get(order_id)
+        prior_updated = (parse_dt(prior.get("updated_at")) if prior else None) or min_dt
+        if prior is None or updated >= prior_updated:
             latest[order_id] = row
 
-    logging.info(
-        "Loaded %d rows; %d unique orders",
-        len(records), len(latest)
-    )
-    return list(latest.values())
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE orders (
+            id TEXT PRIMARY KEY,
+            customer TEXT,
+            product TEXT,
+            region TEXT,
+            status TEXT,
+            currency TEXT,
+            amount REAL,
+            amount_usd REAL,
+            qty REAL,
+            created_at TEXT,
+            created_date TEXT,
+            created_month TEXT,
+            created_year INTEGER,
+            updated_at TEXT
+        )
+    """)
+
+    insert_sql = """INSERT OR REPLACE INTO orders
+        (id, customer, product, region, status, currency, amount, amount_usd,
+         qty, created_at, created_date, created_month, created_year, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+    inserted = 0
+    for row in latest.values():
+        created = parse_dt(row.get("created_at"))
+        currency = str(row.get("currency", "USD")).upper()
+        try:
+            amount = Decimal(str(row.get("amount", 0) or 0))
+            rate = Decimal(str(rates.get(currency, 0) or 0))
+            amount_usd = amount * rate
+        except Exception:
+            amount_usd = Decimal("0")
+        try:
+            qty = float(row.get("qty", 0) or 0)
+        except (ValueError, TypeError):
+            qty = 0
+        conn.execute(insert_sql, (
+            str(row.get("id", "")),
+            str(row.get("customer", "") or ""),
+            str(row.get("product", "") or ""),
+            str(row.get("region", "") or ""),
+            normalize_status(row.get("status")),
+            currency,
+            float(row.get("amount", 0) or 0),
+            float(amount_usd),
+            qty,
+            str(row.get("created_at", "") or ""),
+            created.date().isoformat() if created else None,
+            created.strftime("%Y-%m") if created else None,
+            created.year if created else None,
+            str(row.get("updated_at", "") or ""),
+        ))
+        inserted += 1
+    conn.commit()
+    logging.info("Loaded %d raw records; %d unique orders", len(records), inserted)
+    return conn
 
 
-def usd(row):
-    currency = str(row.get("currency", "USD")).upper()
-    rate = RATES.get(currency)
-    if rate is None:
-        logging.warning("Unknown currency %r", currency)
-        return Decimal("0")
-    return Decimal(str(row.get("amount", 0) or 0)) * rate
+def build_where(question):
+    q = question.lower()
+    clauses = []
+    params = []
 
-
-def parse_filters(question):
-    low = question.lower()
-    f = {}
+    # The ledger questions normally ask about paid sales unless a status is named.
+    if re.search(r"\b(refund|refunded|refunds|money returned)\b", q):
+        clauses.append("status = ?")
+        params.append("refunded")
+    elif re.search(r"\b(void|voided|cancel|cancelled|canceled)\b", q):
+        clauses.append("status = ?")
+        params.append("void")
+    elif re.search(r"\b(paid|revenue|sales|sold|earn|earned|earning|income|turnover|net|top-selling|top selling|best-selling|best selling)\b", q):
+        clauses.append("status = ?")
+        params.append("paid")
+    else:
+        # Default to paid orders for ordinary ledger questions as in the assignment's reference approach.
+        clauses.append("status = ?")
+        params.append("paid")
 
     for region in REGIONS:
-        if re.search(r"\b" + re.escape(region.lower()) + r"\b", low):
-            f["region"] = region
+        if re.search(r"\b" + re.escape(region.lower()) + r"\b", q):
+            clauses.append("region = ?")
+            params.append(region)
             break
 
-    for product in sorted(PRODUCTS, key=len, reverse=True):
-        if re.search(r"\b" + re.escape(product.lower()) + r"\b", low):
-            f["product"] = product
+    for product in PRODUCTS:
+        if re.search(r"\b" + re.escape(product.lower()) + r"s?\b", q):
+            clauses.append("product = ?")
+            params.append(product)
             break
 
-    m = re.search(r"\b(?:customer\s*)?(C\d{3,5})\b", question, re.I)
-    if m:
-        f["customer"] = m.group(1).upper()
+    customer_match = re.search(r"\b(c\d{4,5})\b", q, re.I)
+    if customer_match:
+        clauses.append("UPPER(customer) = ?")
+        params.append(customer_match.group(1).upper())
 
-    m = re.search(r"\b(ORD-\d+)\b", question, re.I)
-    if m:
-        f["id"] = m.group(1).upper()
+    order_match = re.search(r"\b(ord-\d+)\b", q, re.I)
+    if order_match:
+        clauses.append("UPPER(id) = ?")
+        params.append(order_match.group(1).upper())
 
-    for status in ["refunded", "refund", "void", "paid"]:
-        if re.search(r"\b" + status + r"\b", low):
-            f["status"] = (
-                "refunded" if status in ("refund", "refunded") else status
-            )
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    year = int(year_match.group(1)) if year_match else None
+    month = None
+    for name, number in MONTHS.items():
+        if re.search(r"\b" + re.escape(name) + r"\b", q):
+            month = number
             break
+    if month is not None:
+        if year is None:
+            year = 2026
+        clauses.append("created_month = ?")
+        params.append(f"{year:04d}-{month:02d}")
+    elif year is not None and not re.search(r"\b(last|past)\s+\d+\s+days?\b", q):
+        clauses.append("created_year = ?")
+        params.append(year)
 
-    for name, month in MONTHS.items():
-        if re.search(r"\b" + name + r"\b", low):
-            f["month"] = month
-            year = re.search(r"\b(20\d{2})\b", low)
-            if year:
-                f["year"] = int(year.group(1))
-            break
+    dates = sorted(set(re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", q)))
+    if len(dates) == 1:
+        clauses.append("created_date = ?")
+        params.append(dates[0])
+    elif len(dates) >= 2:
+        clauses.append("created_date >= ? AND created_date <= ?")
+        params.extend([dates[0], dates[-1]])
 
-    if "year" not in f:
-        year = re.search(r"\b(20\d{2})\b", low)
-        if year:
-            f["year"] = int(year.group(1))
-
-    dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", low)
-    if dates:
-        f["start_date"] = min(dates)
-        f["end_date"] = max(dates)
-
-    return f
+    return " AND ".join(clauses) if clauses else "1=1", params
 
 
-def filter_rows(rows, f):
-    out = []
-
-    for r in rows:
-        if f.get("region") and str(r.get("region", "")).lower() != f["region"].lower():
-            continue
-        if f.get("product") and str(r.get("product", "")).lower() != f["product"].lower():
-            continue
-        if f.get("customer") and str(r.get("customer", "")).upper() != f["customer"]:
-            continue
-        if f.get("id") and str(r.get("id", "")).upper() != f["id"]:
-            continue
-        if f.get("status") and str(r.get("status", "")).lower() != f["status"]:
-            continue
-
-        dt = parse_dt(r.get("created_at"))
-
-        if f.get("year") or f.get("month"):
-            if not dt:
-                continue
-            if f.get("year") and dt.year != f["year"]:
-                continue
-            if f.get("month") and dt.month != f["month"]:
-                continue
-
-        if f.get("start_date") and (
-            not dt or dt.date().isoformat() < f["start_date"]
-        ):
-            continue
-        if f.get("end_date") and (
-            not dt or dt.date().isoformat() > f["end_date"]
-        ):
-            continue
-
-        out.append(r)
-
-    return out
-
-
-def numeric(v):
-    v = Decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return int(v) if v == v.to_integral_value() else float(v)
-
-
-def answer_question(question, rows):
+def answer_question(question, conn):
     q = question.lower().strip()
-    f = parse_filters(question)
-    matching = filter_rows(rows, f)
+    where, params = build_where(question)
 
-    refund = any(x in q for x in ["refund", "refunded", "money returned"])
-    void = any(x in q for x in ["void", "cancelled", "canceled"])
-    revenue_query = any(x in q for x in [
-        "revenue", "sales", "sold", "earn", "income", "turnover", "net"
-    ])
-
-    if refund:
-        matching = [
-            r for r in matching
-            if str(r.get("status", "")).lower() == "refunded"
-        ]
-    elif void:
-        matching = [
-            r for r in matching
-            if str(r.get("status", "")).lower() == "void"
-        ]
-    elif revenue_query:
-        matching = [
-            r for r in matching
-            if str(r.get("status", "")).lower() == "paid"
-        ]
-
-    # Distinct customer counts must happen before ordinary order counts.
-    distinct_customer = any(x in q for x in [
-        "different customers", "different customer",
-        "unique customers", "unique customer",
-        "distinct customers", "distinct customer",
-    ])
-    if distinct_customer:
-        customers = {
-            str(r.get("customer", "")).strip().upper()
-            for r in matching
-            if r.get("customer") is not None
-            and str(r.get("customer", "")).strip()
-        }
-        return len(customers)
-
-    if any(x in q for x in [
-        "different products", "unique products", "distinct products"
+    # Count distinct customers before generic count/order logic.
+    if any(phrase in q for phrase in [
+        "different customers", "different customer", "distinct customers",
+        "distinct customer", "unique customers", "unique customer",
     ]):
-        products = {
-            str(r.get("product", "")).strip().casefold()
-            for r in matching
-            if r.get("product") is not None
-            and str(r.get("product", "")).strip()
-        }
-        return len(products)
+        sql = f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where} AND TRIM(COALESCE(customer, '')) <> ''"
+        return int(conn.execute(sql, params).fetchone()[0] or 0)
 
-    count = any(x in q for x in [
-        "how many", "number of", "count of", "count the", "number?"
-    ])
-    qty = any(x in q for x in [
-        "units", "items", "pieces", "quantity", "how many products"
-    ])
-    average = any(x in q for x in ["average", "avg", "mean"])
+    if any(phrase in q for phrase in [
+        "different products", "distinct products", "unique products",
+    ]):
+        sql = f"SELECT COUNT(DISTINCT product) FROM orders WHERE {where} AND TRIM(COALESCE(product, '')) <> ''"
+        return int(conn.execute(sql, params).fetchone()[0] or 0)
 
-    top = any(x in q for x in [
-        "most ", "highest", "top ", "top-selling", "top selling",
-        "best-selling", "best selling", "bestselling", "largest",
-        "which product", "which customer",
+    # Rank products/customers/regions using the requested measure.
+    is_top = any(phrase in q for phrase in [
+        "top", "highest", "most", "best-selling", "best selling",
+        "top-selling", "top selling", "largest", "earned the most",
+        "spent the most",
     ])
-    total = any(x in q for x in [
-        "total", "sum", "revenue", "sales", "refund", "refunded",
-        "amount", "value", "earned", "spent", "net",
-    ])
-
-    if re.search(r"\b(list|show|name)\b", q) and (
-        "product" in q or "customer" in q
-    ):
-        field = "product" if "product" in q else "customer"
-        return sorted({
-            str(r.get(field)) for r in matching if r.get(field)
-        })
-
-    if top:
+    if is_top:
         if "customer" in q or "client" in q:
-            key = "customer"
+            group_col = "customer"
         elif "region" in q:
-            key = "region"
+            group_col = "region"
         else:
-            key = "product"
+            group_col = "product"
+        if any(word in q for word in ["unit", "units", "quantity", "qty", "pieces", "items"]):
+            metric = "SUM(qty)"
+        elif "order" in q or "orders" in q:
+            metric = "COUNT(*)"
+        else:
+            metric = "SUM(amount_usd)"
+        sql = f"SELECT {group_col} FROM orders WHERE {where} AND TRIM(COALESCE({group_col}, '')) <> '' GROUP BY {group_col} ORDER BY {metric} DESC, {group_col} ASC LIMIT 1"
+        value = conn.execute(sql, params).fetchone()
+        return value[0] if value else 0
 
-        sums = {}
-        for r in matching:
-            name = str(r.get(key, "")).strip()
-            if not name:
-                continue
+    if re.search(r"\b(list|show|name)\b", q) and ("product" in q or "customer" in q):
+        column = "product" if "product" in q else "customer"
+        sql = f"SELECT DISTINCT {column} FROM orders WHERE {where} AND TRIM(COALESCE({column}, '')) <> '' ORDER BY {column}"
+        return [row[0] for row in conn.execute(sql, params).fetchall()]
 
-            if qty:
-                value = Decimal(str(r.get("qty", 0) or 0))
-            elif any(x in q for x in ["orders", "count", "number"]):
-                value = Decimal("1")
-            else:
-                value = usd(r)
+    if "average" in q or re.search(r"\b(avg|mean)\b", q):
+        sql = f"SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) FROM orders WHERE {where}"
+        return money(conn.execute(sql, params).fetchone()[0] or 0)
 
-            sums[name] = sums.get(name, Decimal("0")) + value
+    if any(phrase in q for phrase in ["how many orders", "number of orders", "count of orders", "count the orders"]):
+        sql = f"SELECT COUNT(*) FROM orders WHERE {where}"
+        return int(conn.execute(sql, params).fetchone()[0] or 0)
 
-        if not sums:
-            return 0
+    if any(phrase in q for phrase in ["how many units", "total quantity", "total units", "number of units", "how many items", "how many pieces"]):
+        sql = f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where}"
+        return int(conn.execute(sql, params).fetchone()[0] or 0)
 
-        best = max(sums.values())
-        winners = sorted(k for k, v in sums.items() if v == best)
-        return winners[0] if len(winners) == 1 else winners
-
-    if count and not total:
-        return len(matching)
-
-    if qty and not total:
-        return sum(int(r.get("qty", 0) or 0) for r in matching)
-
-    if average:
-        if not matching:
-            return 0
-        return numeric(
-            sum((usd(r) for r in matching), Decimal("0"))
-            / Decimal(len(matching))
-        )
-
-    if total or not count:
-        if qty and not any(x in q for x in [
-            "revenue", "sales", "amount", "value", "usd", "money"
-        ]):
-            return sum(int(r.get("qty", 0) or 0) for r in matching)
-        return numeric(sum((usd(r) for r in matching), Decimal("0")))
-
-    return len(matching)
+    # For revenue / amount questions, use USD-normalized amounts.
+    sql = f"SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2) FROM orders WHERE {where}"
+    return money(conn.execute(sql, params).fetchone()[0] or 0)
 
 
 @app.get("/")
@@ -346,18 +317,13 @@ def health():
 @app.post("/ask")
 def ask(body: Question):
     try:
-        return {"answer": answer_question(body.question, load_orders())}
-    except requests.RequestException as e:
-        logging.exception("Ledger export fetch failed")
-        raise HTTPException(
-            status_code=502,
-            detail="Could not load ledger data",
-        ) from e
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    except (ValueError, json.JSONDecodeError) as e:
-        logging.exception("Ledger export parse failed")
-        raise HTTPException(
-            status_code=502,
-            detail="Ledger export was not valid NDJSON",
-        ) from e
+        conn = load_database()
+        return {"answer": answer_question(body.question, conn)}
+    except requests.RequestException as exc:
+        logging.exception("Ledger source request failed")
+        raise HTTPException(status_code=502, detail="Could not load ledger data") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+        logging.exception("Ledger processing failed")
+        raise HTTPException(status_code=502, detail="Ledger data could not be processed") from exc

@@ -102,7 +102,7 @@ def answer_question(question, rows):
     void = any(x in q for x in ["void", "cancelled", "canceled"])
     if refund: matching = [r for r in matching if r.get("status", "").lower() == "refunded"]
     elif void: matching = [r for r in matching if r.get("status", "").lower() == "void"]
-    elif any(x in q for x in ["revenue", "sales", "sold", "earning", "income", "turnover", "net"]):
+    elif any(x in q for x in ["revenue", "sales", "sold", "earn", "income", "turnover", "net"]):
         matching = [r for r in matching if r.get("status", "").lower() == "paid"]
     count = any(x in q for x in ["how many", "number of", "count of", "count the", "number?"])
     qty = any(x in q for x in ["units", "items", "pieces", "quantity", "how many products"])

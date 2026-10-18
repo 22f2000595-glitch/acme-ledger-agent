@@ -96,39 +96,88 @@ def numeric(v):
     v = Decimal(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return int(v) if v == v.to_integral_value() else float(v)
 
+
 def answer_question(question, rows):
-    q = question.lower().strip(); f = parse_filters(question); matching = filter_rows(rows, f)
+    q = question.lower().strip()
+    f = parse_filters(question)
+    matching = filter_rows(rows, f)
+
     refund = any(x in q for x in ["refund", "refunded", "money returned"])
     void = any(x in q for x in ["void", "cancelled", "canceled"])
-    if refund: matching = [r for r in matching if r.get("status", "").lower() == "refunded"]
-    elif void: matching = [r for r in matching if r.get("status", "").lower() == "void"]
-    elif any(x in q for x in ["revenue", "sales", "sold", "earn", "income", "turnover", "net"]):
-        matching = [r for r in matching if r.get("status", "").lower() == "paid"]
-    count = any(x in q for x in ["how many", "number of", "count of", "count the", "number?"])
-    qty = any(x in q for x in ["units", "items", "pieces", "quantity", "how many products"])
+    revenue_query = any(x in q for x in [
+        "revenue", "sales", "sold", "earn", "earned", "earning",
+        "income", "turnover", "net", "by revenue"
+    ])
+
+    if refund:
+        matching = [r for r in matching if str(r.get("status", "")).lower() == "refunded"]
+    elif void:
+        matching = [r for r in matching if str(r.get("status", "")).lower() == "void"]
+    elif revenue_query:
+        matching = [r for r in matching if str(r.get("status", "")).lower() == "paid"]
+
+    count = any(x in q for x in [
+        "how many", "number of", "count of", "count the", "number?"
+    ])
+    qty = any(x in q for x in [
+        "units", "items", "pieces", "quantity", "how many products"
+    ])
     average = any(x in q for x in ["average", "avg", "mean"])
-    top = any(x in q for x in ["most ", "highest", "top ", "best-selling", "bestselling", "largest", "which product", "which customer"])
-    total = any(x in q for x in ["total", "sum", "revenue", "sales", "refund", "refunded", "amount", "value", "earned", "spent", "net"])
+    top = any(x in q for x in [
+        "most ", "highest", "top ", "top-selling", "top selling",
+        "best-selling", "best selling", "bestselling", "largest",
+        "which product", "which customer"
+    ])
+    total = any(x in q for x in [
+        "total", "sum", "revenue", "sales", "refund", "refunded",
+        "amount", "value", "earned", "spent", "net"
+    ])
+
     if re.search(r"\b(list|show|name)\b", q) and ("product" in q or "customer" in q):
         field = "product" if "product" in q else "customer"
         return sorted({str(r.get(field)) for r in matching if r.get(field)})
+
     if top:
-        key = "customer" if ("customer" in q or "client" in q) else "region" if "region" in q else "product"
+        key = "customer" if ("customer" in q or "client" in q) else (
+            "region" if "region" in q else "product"
+        )
         sums = {}
         for r in matching:
             name = str(r.get(key, ""))
-            val = Decimal(str(r.get("qty", 0) or 0)) if qty else Decimal("1") if any(x in q for x in ["orders", "count", "number"]) else usd(r)
+            if not name:
+                continue
+            if qty:
+                val = Decimal(str(r.get("qty", 0) or 0))
+            elif any(x in q for x in ["orders", "count", "number"]):
+                val = Decimal("1")
+            else:
+                val = usd(r)
             sums[name] = sums.get(name, Decimal("0")) + val
-        if not sums: return 0
-        best = max(sums.values()); winners = sorted(k for k,v in sums.items() if v == best)
-        return winners[0] if len(winners)==1 else winners
-    if count and not total: return len(matching)
-    if qty and not total: return sum(int(r.get("qty", 0) or 0) for r in matching)
-    if average: return numeric(sum((usd(r) for r in matching), Decimal("0")) / Decimal(len(matching))) if matching else 0
+
+        if not sums:
+            return 0
+        best = max(sums.values())
+        winners = sorted(k for k, v in sums.items() if v == best)
+        return winners[0] if len(winners) == 1 else winners
+
+    if count and not total:
+        return len(matching)
+
+    if qty and not total:
+        return sum(int(r.get("qty", 0) or 0) for r in matching)
+
+    if average:
+        return numeric(
+            sum((usd(r) for r in matching), Decimal("0")) / Decimal(len(matching))
+        ) if matching else 0
+
     if total or not count:
-        if qty and not any(x in q for x in ["revenue", "sales", "amount", "value", "usd", "money"]):
+        if qty and not any(x in q for x in [
+            "revenue", "sales", "amount", "value", "usd", "money"
+        ]):
             return sum(int(r.get("qty", 0) or 0) for r in matching)
         return numeric(sum((usd(r) for r in matching), Decimal("0")))
+
     return len(matching)
 
 @app.get("/")

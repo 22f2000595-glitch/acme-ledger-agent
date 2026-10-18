@@ -318,6 +318,18 @@ def answer_question(question, conn):
     return money(conn.execute(sql, params).fetchone()[0] or 0)
 
 
+@app.on_event("startup")
+def warm_database():
+    """Fetch and prepare the ledger before the service accepts grader requests."""
+    try:
+        load_database()
+        logging.info("Ledger database preloaded successfully")
+    except Exception:
+        # Keep the app available so /health and diagnostics still work. The first
+        # question request will retry and return a useful HTTP error if needed.
+        logging.exception("Ledger preload failed; database will retry on first request")
+
+
 @app.get("/")
 def root():
     return {

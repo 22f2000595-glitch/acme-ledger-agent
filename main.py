@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from functools import lru_cache
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from zoneinfo import ZoneInfo
 
 import requests
@@ -39,13 +39,32 @@ class Question(BaseModel):
 
 
 def make_rates_url(export_url: str) -> str:
-    """Use the same assignment query parameters, changing only /export to /rates."""
+    """Build the matching /rates endpoint while preserving assignment credentials."""
     parts = urlsplit(export_url)
+
+    # Assignment URLs often encode the endpoint as ?path=/export on questionData.
+    query_items = parse_qsl(parts.query, keep_blank_values=True)
+    has_path_param = any(key == "path" for key, _ in query_items)
+
+    if has_path_param:
+        query_items = [
+            (key, "/rates" if key == "path" else value)
+            for key, value in query_items
+        ]
+        return urlunsplit((
+            parts.scheme, parts.netloc, parts.path,
+            urlencode(query_items), parts.fragment
+        ))
+
+    # Also support URLs where /export is the actual URL path.
     path = parts.path.rstrip("/")
     if path.endswith("/export"):
         path = path[:-len("/export")] + "/rates"
     else:
-        path = "/rates"
+        raise ValueError(
+            "Cannot derive /rates URL: LEDGER_EXPORT_URL must end in /export "
+            "or contain the query parameter path=/export"
+        )
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 

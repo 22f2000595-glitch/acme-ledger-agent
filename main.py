@@ -305,7 +305,16 @@ def answer_question(question, conn):
         sql = f"SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) FROM orders WHERE {where}"
         return money(conn.execute(sql, params).fetchone()[0] or 0)
 
-    if any(phrase in q for phrase in ["how many orders", "number of orders", "count of orders", "count the orders"]):
+    # Count order records when the wording asks to count orders, including
+    # phrases such as "Count the refunded North orders ...". Keep this before
+    # the default revenue SUM so a count request never returns a money amount.
+    asks_order_count = (
+        re.search(r"\b(count|how many|number of)\b", q) is not None
+        and re.search(r"\borders?\b", q) is not None
+    ) or any(phrase in q for phrase in [
+        "count of orders", "count the orders", "how many refunded"
+    ])
+    if asks_order_count:
         sql = f"SELECT COUNT(*) FROM orders WHERE {where}"
         return int(conn.execute(sql, params).fetchone()[0] or 0)
 
